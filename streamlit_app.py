@@ -1,4 +1,4 @@
-# app.py — 팟캐스트 AI 코치 (화자 수 필수 입력 + 화자분리/진단/통계/타임라인/Gemini 통합)
+# app.py — 팟캐스트 AI 코치 (배치=1 안전화, 화자 수 필수 입력, 화자분리/진단/통계/타임라인/Gemini 통합)
 
 import streamlit as st
 import pandas as pd
@@ -24,7 +24,7 @@ except Exception:
 
 # ==================== Config & Secrets ====================
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY")
-HF_TOKEN = st.secrets.get("HF_TOKEN")   # 없으면 화자분리 비활성
+HF_TOKEN = st.secrets.get("HF_TOKEN")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -57,15 +57,48 @@ model_whisper = load_whisper()
 
 @st.cache_resource
 def load_diar_pipeline():
-    """pyannote diarization pipeline (토큰 없으면 None 반환)"""
-    if not HF_TOKEN:
+    """pyannote diarization pipeline (토큰 없거나 로드 실패 시 None) — 배치=1로 강제"""
+    # 빈 문자열/공백 토큰 방지
+    if not HF_TOKEN or not str(HF_TOKEN).strip():
         return None
     try:
         from pyannote.audio import Pipeline
-        pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=HF_TOKEN)
+        pipe = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=HF_TOKEN
+        )
+        # CPU 강제 (GPU 없는 환경 대비)
+        try:
+            pipe.to("cpu")
+        except Exception:
+            pass
+
+        # 🔒 안전화 포인트: 배치 1로 고정 (waveform 길이 불일치 vstack 오류 회피)
+        try:
+            if hasattr(pipe, "embedding") and hasattr(pipe.embedding, "batch_size"):
+                pipe.embedding.batch_size = 1
+        except Exception:
+            pass
+        try:
+            if hasattr(pipe, "segmentation") and hasattr(pipe.segmentation, "batch_size"):
+                pipe.segmentation.batch_size = 1
+        except Exception:
+            pass
+
         return pipe
     except Exception as e:
-        st.warning(f"화자 분리 파이프라인 로드 실패: {e}")
+        msg = str(e)
+        # 게이트(약관 동의) 안내
+        if ("pyannote/segmentation-3.0" in msg) and ("gated" in msg or "authenticate" in msg):
+            st.warning(
+                "🔐 **pyannote 모델 접근 권한이 필요합니다.**\n"
+                "- Hugging Face 로그인 후 아래 모델 페이지에서 **Access/Agree**를 눌러 주세요.\n"
+                "  1) pyannote/segmentation-3.0\n"
+                "  2) (가능하면) pyannote/speaker-diarization-3.1\n"
+                "그 다음 캐시를 지우고 다시 실행해 주세요."
+            )
+        else:
+            st.warning(f"화자 분리 파이프라인 로드 실패: {type(e).__name__}: {e}")
         return None
 diar_pipeline = load_diar_pipeline()
 
@@ -111,7 +144,13 @@ def diarize_audio(file_path, progress_callback=None, num_speakers: int | None = 
     if num_speakers and num_speakers > 0:
         diar_kwargs["num_speakers"] = int(num_speakers)
 
-    diar = diar_pipeline(file_path, **diar_kwargs)
+    try:
+        diar = diar_pipeline(file_path, **diar_kwargs)
+    except RuntimeError as e:
+        # 배치=1에서 거의 사라지지만 혹시 모를 안전망
+        st.error("화자 분리 중 런타임 오류가 발생했습니다. 파일 끝 길이 불일치 가능성이 높습니다. "
+                 "다시 한 번 실행해 보세요. 문제가 지속되면 파일을 재인코딩(16kHz mono) 후 시도해 주세요.")
+        raise e
 
     out = []
     for turn, _, spk in diar.itertracks(yield_label=True):
@@ -208,7 +247,7 @@ with st.form("analyze_form", clear_on_submit=False):
     else:
         use_diar = False
         num_speakers = None
-        st.info("ℹ️ Hugging Face 토큰이 없어 화자 분리를 건너뜁니다. (단일 화자 처리)")
+        st.info("ℹ️ 화자 분리를 건너뜁니다. (HF 토큰 미설정/약관 미동의/파이프라인 로드 실패)")
 
     submit = st.form_submit_button("🤖 AI 분석 시작하기")
 
@@ -244,8 +283,10 @@ with st.form("analyze_form", clear_on_submit=False):
         # 3) Gemini 평가
         gem = gemini_podcast_analysis(df, topic_hint, step)
 
-        try: os.remove(tmp_path)
-        except: pass
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
         st.session_state.analysis_complete = True
         st.session_state.df = df
@@ -264,7 +305,7 @@ if st.session_state.get("analysis_complete"):
     if 'diar_df' in st.session_state:
         dd = st.session_state.diar_df
         if dd.empty:
-            st.info("ℹ️ 화자 분리 결과가 비어 있습니다. (토큰 미설정/모델 로드 실패/1인 화자 가능)")
+            st.info("ℹ️ 화자 분리 결과가 비어 있습니다. (토큰 미설정/약관 미동의/모델 로드 실패/1인 화자 가능)")
         else:
             st.success(f"✅ 화자 분리 완료: 세그먼트 {len(dd)}개, 화자 {dd['speaker'].nunique()}명")
             with st.expander("화자 분리 원시 세그먼트 보기"):
